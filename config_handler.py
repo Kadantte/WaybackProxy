@@ -1,7 +1,6 @@
 import json
 
-# Host address to bind to for the HTTP proxy (default of "" means "all
-# interfaces").
+# Host address to bind to for the HTTP proxy (leave blank to bind on all interfaces).
 global HOST
 
 # Listen port for the HTTP proxy.
@@ -18,8 +17,9 @@ global DATE_TOLERANCE
 # Send Geocities requests to oocities.org if set to True.
 global GEOCITIES_FIX
 
-# Use the original Wayback Machine URL as a shortcut when loading images.
-# May result in faster page loads, but all images will point to
+# Use the original Wayback Machine URL as a shortcut when loading images. The
+# browser must have an Internet connection that can reach the Wayback Machine for
+# this to work. Will result in faster page loads, but all images will point to
 # http://web.archive.org/... as a side effect. Set this value to 2 to enable an
 # experimental mode using authentication on top of the original URLs instead
 # (which is not supported by Internet Explorer and some other browsers).

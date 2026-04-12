@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, collections, datetime, json, re, socket, socketserver, string, sys, threading, time, traceback, urllib.parse
+import base64, collections, datetime, fnmatch, json, re, socket, socketserver, string, sys, threading, time, traceback, urllib.parse
 try:
 	import urllib3
 except ImportError:
@@ -106,6 +106,13 @@ class SharedState:
 		except:
 			self.whitelist = []
 
+		# Add whitelist entries for base domains and URLs on wildcard matches.
+		for i in range(len(self.whitelist)):
+			if self.whitelist[i][:2] == '*.':
+				self.whitelist.append(self.whitelist[i][2:])
+			if self.whitelist[i][-2:] == '/*':
+				self.whitelist.append(self.whitelist[i][:-2])
+
 shared_state = SharedState()
 
 class Handler(socketserver.BaseRequestHandler):
@@ -121,38 +128,41 @@ class Handler(socketserver.BaseRequestHandler):
 	def handle(self):
 		"""Handle a request."""
 
-		# readline is pretty convenient
+		# Create reader for the HTTP request.
 		f = self.request.makefile()
 
-		# read request line
-		reqline = line = f.readline()
+		# Read the request line.
+		line = f.readline()
+		passthrough = [line, 'Connection: close']
 		split = line.rstrip().split(' ')
-		http_version = len(split) > 2 and split[2].upper() or 'HTTP/0.9'
+		if len(split) < 2:
+			return self.request.close() # invalid
+		http_method = split[0].upper()
+		http_version = split[2].upper() if len(split) > 2 else None
 
-		if len(split) < 2 or split[0].upper() != 'GET':
-			# only GET is implemented
-			return self.send_error_page(http_version, 501, 'Not Implemented', extra=split[0])
-
-		# read out the headers
+		# Read the headers.
 		request_host = None
 		pac_host = '" + location.host + ":' + str(LISTEN_PORT) # may not actually work
 		effective_date = DATE
 		auth = None
-		while line.strip() != '':
-			line = f.readline()
-			ll = line.lower()
-			if ll[:6] == 'host: ':
-				pac_host = request_host = line[6:].rstrip()
-				if ':' not in pac_host: # explicitly specify port if running on port 80
-					pac_host += ':80'
-			elif ll[:21] == 'x-waybackproxy-date: ':
-				# API for a personal project of mine
-				effective_date = line[21:].rstrip()
-			elif ll[:21] == 'authorization: basic ':
-				# asset date code passed as username:password
-				auth = base64.b64decode(ll[21:])
+		if http_version:
+			while line.strip() != '':
+				line = f.readline()
+				ll = line.lower()
+				if ll[:6] == 'host: ':
+					pac_host = request_host = line[6:].rstrip()
+					if ':' not in pac_host: # explicitly specify port if running on port 80
+						pac_host += ':80'
+				elif ll[:21] == 'x-waybackproxy-date: ':
+					# API for a personal project of mine
+					effective_date = line[21:].rstrip()
+				elif ll[:21] == 'authorization: basic ':
+					# asset date code passed as username:password
+					auth = base64.b64decode(ll[21:])
+				if ll[:12] != 'connection: ': # prevent keepalive in passthrough
+					passthrough.append(line)
 
-		# parse the URL
+		# Parse the URL.
 		pac_file_paths = ('/proxy.pac', '/wpad.dat', '/wpad.da')
 		if split[1][0] == '/' and split[1] not in pac_file_paths:
 			# just a path (not corresponding to a PAC file) => transparent proxy
@@ -161,50 +171,87 @@ class Handler(socketserver.BaseRequestHandler):
 				return self.send_error_page(http_version, 400, 'Host header missing')
 			archived_url = 'http://' + request_host + split[1]
 		else:
-			# full URL => explicit proxy
+			# full URL => non-transparent proxy
 			archived_url = split[1]
 		request_url = archived_url
 		parsed = urllib.parse.urlparse(request_url)
 
-		# make a path
+		# Get the URL's path and hostname.
 		path = parsed.path
+		if path == '':
+			path = '/'
 		if parsed.query:
 			path += '?' + parsed.query
-		elif path == '':
-			path == '/'
-
-		# get the hostname for later
-		host = parsed.netloc.split(':')
+		host = (archived_url if http_method == 'CONNECT' else parsed.netloc).split(':')
 		hostname = host[0]
+		try:
+			port = int(host[1])
+		except:
+			port = 80
 
-		# get cached date for redirects, if available
+		# Get cached date for redirects, if available.
 		original_date = effective_date
 		effective_date = self.shared_state.date_cache.get(str(effective_date) + '\x00' + str(archived_url), effective_date)
 
-		# get date from username:password, if available
+		# Get date from username:password, if available.
 		if auth:
 			effective_date = auth.replace(':', '')
 
-		# Effectively handle the request.
+		# Handle the request.
 		try:
-			if path in pac_file_paths:
-				# PAC file to bypass QUICK_IMAGES requests if WAYBACK_API is not enabled.
-				pac  = http_version + ''' 200 OK\r\n'''
-				pac += '''Content-Type: application/x-ns-proxy-autoconfig\r\n'''
-				pac += '''\r\n'''
-				pac += '''function FindProxyForURL(url, host)\r\n'''
-				pac += '''{\r\n'''
-				if not WAYBACK_API:
-					pac += '''	if (shExpMatch(url, "http://web.archive.org/web/*") && !shExpMatch(url, "http://web.archive.org/web/??????????????if_/*"))\r\n'''
-					pac += '''	{\r\n'''
-					pac += '''		return "DIRECT";\r\n'''
-					pac += '''	}\r\n'''
-				pac += '''	return "PROXY ''' + pac_host + '''";\r\n'''
-				pac += '''}\r\n'''
-				self.request.sendall(pac.encode('ascii', 'ignore'))
-				return
-			elif hostname in self.shared_state.whitelist:
+			if any((fnmatch.fnmatch(hostname, entry) or ('/' in entry and fnmatch.fnmatch(hostname + path, entry))) for entry in self.shared_state.whitelist):
 				_print('[>] [byp]', archived_url)
+
+				# Connect to the destination.
+				conn = socket.create_connection((hostname, port))
+
+				if http_method == 'CONNECT':
+					# Send CONNECT response.
+					if http_version:
+						self.request.sendall((http_version + ' 200 Connection established\r\n\r\n').encode('ascii', 'ignore'))
+				else:
+					# Pass the request through.
+					conn.sendall(b''.join((line.rstrip('\r\n') + '\r\n').encode('utf8', 'ignore') for line in passthrough))
+
+				# Pass data through in both directions.
+				self.request.setblocking(False)
+				conn.setblocking(False)
+				while True:
+					for pair in ((self.request, conn), (conn, self.request)):
+						try:
+							data = pair[0].recv(4096)
+							assert data
+							pair[1].sendall(data)
+						except BlockingIOError:
+							pass
+						except:
+							# One side has disconnected => disconnect the other side and stop.
+							for sock in pair:
+								try:
+									sock.close()
+								except:
+									pass
+							return
+			elif http_method != 'GET': # only GET is implemented outside of bypass
+				return self.send_error_page(http_version, 501, 'Not Implemented', extra=http_method)
+			elif path in pac_file_paths:
+				# PAC file to bypass QUICK_IMAGES requests if WAYBACK_API is not enabled.
+				pac = ''
+				if http_version:
+					pac += (
+						http_version + ' 200 OK\r\n'
+						'Content-Type: application/x-ns-proxy-autoconfig\r\n'
+						'\r\n'
+					)
+				pac += 'function FindProxyForURL(url, host) {\r\n'
+				if not WAYBACK_API:
+					pac += '	if (shExpMatch(url, "http://web.archive.org/web/*") && !shExpMatch(url, "http://web.archive.org/web/??????????????if_/*")) return "DIRECT";\r\n'
+				pac += (
+					'	return "PROXY '+ pac_host + '";\r\n'
+					'}\r\n'
+				)
+				self.request.sendall(pac.encode('ascii', 'ignore'))
+				return self.request.close()
 			elif hostname == 'web.archive.org':
 				if path[:5] != '/web/':
 					# Launch settings if enabled.
@@ -311,10 +358,10 @@ class Handler(socketserver.BaseRequestHandler):
 					guessed_content_type = content_type
 				if 'javascript' in guessed_content_type:
 					match = re.match('''(https?://web\\.archive\\.org/web/[0-9]+)([^/]*)(.+)''', request_url)
-					if match and match.group(2) != 'im_':
+					if match and match.group(2) != 'id_':
 						self.drain_conn(conn)
 						conn.release_conn()
-						request_url = match.group(1) + 'im_' + match.group(3)
+						request_url = match.group(1) + 'id_' + match.group(3)
 						continue
 
 				# This request can proceed.
@@ -379,7 +426,7 @@ class Handler(socketserver.BaseRequestHandler):
 				return self.send_redirect_page(http_version, archived_url, 301)
 
 			# Check if the date is within tolerance.
-			if DATE_TOLERANCE != None:
+			if DATE_TOLERANCE:
 				match = re.search('''(?://web\\.archive\\.org|^)/web/([0-9]+)''', conn.geturl() or '')
 				if match:
 					requested_date = match.group(1)
@@ -491,7 +538,7 @@ class Handler(socketserver.BaseRequestHandler):
 							return match.group(3) == b'https://' and b'http://' or match.group(3) # convert secure non-asset URLs to regular HTTP
 						asset_type = match.group(2)
 						if asset_type == b'js_': # cut down on the JavaScript detector's second request
-							asset_type = b'im_'
+							asset_type = b'id_'
 						if QUICK_IMAGES == 2:
 							return b'http://' + match.group(1) + b':' + asset_type + b'@'
 						else:
@@ -541,6 +588,10 @@ class Handler(socketserver.BaseRequestHandler):
 	def send_response_headers(self, conn, http_version, content_type, request_url, content_length=False):
 		"""Generate and send the response headers."""
 
+		# Not applicable for HTTP/0.9.
+		if not http_version:
+			return
+
 		# Pass the HTTP version, and error code if there is one.
 		response = '{0} {1} {2}'.format(http_version, conn.status, conn.reason.replace('\n', ' '))
 
@@ -562,7 +613,7 @@ class Handler(socketserver.BaseRequestHandler):
 			elif content_length and header.lower() == 'content-length':
 				response += '\r\n' + header + ': ' + conn.headers[header]
 
-		# Finish and send the request.
+		# Finish and send the headers.
 		response += '\r\n\r\n'
 		self.request.sendall(response.encode('utf8', 'ignore'))
 
@@ -601,13 +652,14 @@ class Handler(socketserver.BaseRequestHandler):
 		error_page_len = len(error_page)
 
 		# Send formatted error page and stop.
-		self.request.sendall(
-			'{http_version} {code} {reason}\r\n'
-			'Content-Type: text/html\r\n'
-			'Content-Length: {error_page_len}\r\n'
-			'\r\n'
-			.format(**locals()).encode('utf8', 'ignore')
-		)
+		if http_version:
+			error_page = (
+				'{http_version} {code} {reason}\r\n'
+				'Content-Type: text/html\r\n'
+				'Content-Length: {error_page_len}\r\n'
+				'\r\n'
+				.format(**locals()).encode('utf8', 'ignore') + error_page
+			)
 		self.request.sendall(error_page)
 		self.request.close()
 
@@ -615,19 +667,28 @@ class Handler(socketserver.BaseRequestHandler):
 		"""Generate a redirect page."""
 
 		# Make redirect page.
-		redirect_page = '<html><head><title>Redirect</title><meta http-equiv="refresh" content="0;url=${target}"></head><body><p>If you are not redirected, <a href="${target}">click here</a>.</p></body></html>'
+		target_html = target
+		for c in '<>"\';':
+			target_html = target_html.replace(c, '%{0:02X}'.format(ord(c)))
+		target_js = target_html.replace('\\', '\\\\')
+		redirect_page = (
+			'<html><head><title>Redirect</title><meta http-equiv="refresh" content="0;url=${target_html}"><script language="javascript"><!--\n'
+			'document.location.href = "${target_js}";\n'
+			'--></script></head><body><p>If you are not redirected, <a href="${target_html}">click here</a>.</p></body></html>'
+		)
 		redirect_page = string.Template(redirect_page).substitute(**locals()).encode('utf8', 'ignore')
 		redirect_page_len = len(redirect_page)
 
 		# Send redirect page and stop.
-		self.request.sendall(
-			'{http_version} {code} Found\r\n'
-			'Location: {target}\r\n'
-			'Content-Type: text/html\r\n'
-			'Content-Length: {redirect_page_len}\r\n'
-			'\r\n'
-			.format(**locals()).encode('utf8', 'ignore')
-		)
+		if http_version:
+			redirect_page = (
+				'{http_version} {code} Found\r\n'
+				'Location: {target}\r\n'
+				'Content-Type: text/html\r\n'
+				'Content-Length: {redirect_page_len}\r\n'
+				'\r\n'
+				.format(**locals()).encode('utf8', 'ignore') + redirect_page
+			)
 		self.request.sendall(redirect_page)
 		self.request.close()
 
@@ -658,15 +719,18 @@ class Handler(socketserver.BaseRequestHandler):
 		if query != '': # handle any parameters that may have been sent
 			parsed = urllib.parse.parse_qs(query)
 
-			if 'date' in parsed and 'dateTolerance' in parsed:
+			if 'date' in parsed:
 				if DATE != parsed['date'][0]:
 					DATE = parsed['date'][0]
 					self.shared_state.date_cache.clear()
 					self.shared_state.availability_cache.clear()
-				if DATE_TOLERANCE != parsed['dateTolerance'][0]:
-					DATE_TOLERANCE = parsed['dateTolerance'][0]
+				try:
+					DATE_TOLERANCE = int(parsed['dateTolerance'][0])
+				except:
+					DATE_TOLERANCE = None
 				GEOCITIES_FIX = 'gcFix' in parsed
 				QUICK_IMAGES = 'quickImages' in parsed
+				WAYBACK_API = 'waybackApi' in parsed
 				CONTENT_TYPE_ENCODING = 'ctEncoding' in parsed
 
 		# send the page and stop
@@ -677,14 +741,18 @@ class Handler(socketserver.BaseRequestHandler):
 		settingspage += '<p>Date to get pages from: <input type="text" name="date" size="8" value="'
 		settingspage += str(DATE)
 		settingspage += '"><p>Date tolerance: <input type="text" name="dateTolerance" size="8" value="'
-		settingspage += str(DATE_TOLERANCE)
-		settingspage += '"> days<br><input type="checkbox" name="gcFix"'
+		if DATE_TOLERANCE:
+			settingspage += str(DATE_TOLERANCE)
+		settingspage += '" placeholder="Off"> days<br><input type="checkbox" name="gcFix"'
 		if GEOCITIES_FIX:
 			settingspage += ' checked'
 		settingspage += '> Geocities Fix<br><input type="checkbox" name="quickImages"'
 		if QUICK_IMAGES:
 			settingspage += ' checked'
-		settingspage += '> Quick images<br><input type="checkbox" name="ctEncoding"'
+		settingspage += '> Quick images<br><input type="checkbox" name="waybackApi"'
+		if QUICK_IMAGES:
+			settingspage += ' checked'
+		settingspage += '> Use Wayback API<br><input type="checkbox" name="ctEncoding"'
 		if CONTENT_TYPE_ENCODING:
 			settingspage += ' checked'
 		settingspage += '> Encoding in Content-Type</p><p><input type="submit" value="Save"></p></form></body></html>'
